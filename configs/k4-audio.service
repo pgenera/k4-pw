@@ -1,0 +1,25 @@
+# Manual-only systemd user unit for the Elecraft K4 PipeWire audio bridge.
+# Do NOT run `systemctl --user enable k4-audio` — virtual PipeWire nodes are
+# ephemeral and exist only while this service (or scripts/k4-wsjtx) runs.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp configs/k4-audio.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#
+# Usage:
+#   systemctl --user start k4-audio
+#   systemctl --user stop k4-audio
+
+[Unit]
+Description=Elecraft K4 PipeWire Audio Bridge
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service pipewire-pulse.service
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/k4-audio/config.env
+# Adjust ExecStart if cloned to %h/k4-pw instead of %h/k4-audio:
+ExecStart=%h/k4-audio/bin/k4-audio
+Restart=on-failure
+RestartSec=3

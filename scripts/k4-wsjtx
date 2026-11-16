@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$ROOT_DIR/bin/k4-audio"
+
+if ! command -v wsjtx >/dev/null 2>&1; then
+    echo "error: wsjtx not found in PATH (install with: sudo apt install wsjtx-improved)" >&2
+    exit 1
+fi
+
+if [[ ! -x "$BIN" ]]; then
+    mkdir -p "$ROOT_DIR/bin"
+    go -C "$ROOT_DIR" build -o "$BIN" ./cmd/k4-audio
+fi
+
+check_args=()
+prev_flag=""
+for arg in "$@"; do
+    case "$prev_flag" in
+        --rx-node|--tx-node)
+            check_args+=("$prev_flag=$arg")
+            prev_flag=""
+            continue
+            ;;
+    esac
+    case "$arg" in
+        --rx-node=*|--tx-node=*)
+            check_args+=("$arg")
+            ;;
+        --rx-node|--tx-node)
+            prev_flag="$arg"
+            ;;
+    esac
+done
+
+BRIDGE_PID=""
+WSJTX_PID=""
+cleanup() {
+    local rc="${1:-$?}"
+    trap - EXIT INT TERM
+    if [[ -n "$WSJTX_PID" ]] && kill -0 "$WSJTX_PID" 2>/dev/null; then
+        kill -TERM "$WSJTX_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$BRIDGE_PID" ]] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
+        kill -TERM "$BRIDGE_PID" 2>/dev/null || true
+        local i=0
+        while kill -0 "$BRIDGE_PID" 2>/dev/null && [[ $i -lt 60 ]]; do
+            sleep 0.05
+            i=$((i + 1))
+        done
+        if kill -0 "$BRIDGE_PID" 2>/dev/null; then
+            kill -KILL "$BRIDGE_PID" 2>/dev/null || true
+        fi
+        wait "$BRIDGE_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$WSJTX_PID" ]]; then
+        wait "$WSJTX_PID" 2>/dev/null || true
+    fi
+    exit "$rc"
+}
+trap 'cleanup "$?"' EXIT
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+
+"$BIN" "$@" &
+BRIDGE_PID=$!
+
+ready=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+        wait "$BRIDGE_PID"
+        exit $?
+    fi
+    if "$BIN" check ${check_args[@]+"${check_args[@]}"} >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 0.05
+done
+
+if [[ "$ready" -ne 1 ]]; then
+    echo "error: k4-audio PipeWire nodes did not become ready within 3s" >&2
+    exit 1
+fi
+
+wsjtx <&0 &
+WSJTX_PID=$!
+
+wsjtx_rc=0
+wait "$WSJTX_PID" || wsjtx_rc=$?
+WSJTX_PID=""
+exit "$wsjtx_rc"
