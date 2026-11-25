@@ -19,7 +19,7 @@ Wants=pipewire.service pipewire-pulse.service
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/k4-audio/config.env
-# Adjust ExecStart if cloned to %h/k4-pw instead of %h/k4-audio:
-ExecStart=%h/k4-audio/bin/k4-audio
+# Adjust ExecStart if cloned elsewhere:
+ExecStart=%h/k4-pw/bin/k4-audio
 Restart=on-failure
 RestartSec=3

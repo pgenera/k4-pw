@@ -63,21 +63,25 @@ trap 'cleanup "$?"' EXIT
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
 
-"$BIN" "$@" &
-BRIDGE_PID=$!
+if "$BIN" check ${check_args[@]+"${check_args[@]}"} >/dev/null 2>&1; then
+    ready=1
+else
+    "$BIN" "$@" &
+    BRIDGE_PID=$!
 
-ready=0
-for _ in $(seq 1 60); do
-    if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
-        wait "$BRIDGE_PID"
-        exit $?
-    fi
-    if "$BIN" check ${check_args[@]+"${check_args[@]}"} >/dev/null 2>&1; then
-        ready=1
-        break
-    fi
-    sleep 0.05
-done
+    ready=0
+    for _ in $(seq 1 60); do
+        if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+            wait "$BRIDGE_PID"
+            exit $?
+        fi
+        if "$BIN" check ${check_args[@]+"${check_args[@]}"} >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        sleep 0.05
+    done
+fi
 
 if [[ "$ready" -ne 1 ]]; then
     echo "error: k4-audio PipeWire nodes did not become ready within 3s" >&2

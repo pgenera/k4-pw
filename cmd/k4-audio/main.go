@@ -48,7 +48,6 @@ func defaultCLIConfig() cliConfig {
 		BufferMs:         40,
 		SilenceThreshold: 2,
 		TxHoldMs:         100,
-		TxCatOnAudio:     true,
 		Backend:          "auto",
 		RxNode:           pwDef.RxName,
 		TxNode:           pwDef.TxName,
@@ -309,7 +308,7 @@ func printWSJTXSummary(w io.Writer, host, rxNode, txNode string) {
 		targetHost = "<k4-ip>"
 	}
 	fmt.Fprintln(w, "wsjtx-improved configuration:")
-	fmt.Fprintf(w, "  Radio: Rig=Elecraft K4, Network Server=%s:9200, PTT=VOX, Mode=Data/Pkt, Split=Fake It\n", targetHost)
+	fmt.Fprintf(w, "  Radio: Rig=Elecraft K4, Network Server=%s:9200, PTT=CAT, Mode=Data/Pkt\n", targetHost)
 	fmt.Fprintf(w, "  Audio Input:  %s (%s) -> Left (Main RX) or Right (Sub RX)\n", rxNode, pwDef.RxDescription)
 	fmt.Fprintf(w, "  Audio Output: %s (%s)\n", txNode, pwDef.TxDescription)
 }

@@ -61,7 +61,7 @@ All `~/.config/k4-audio/config.env` settings can be overridden via CLI flags:
 - `--rx-gain-db=0` / `--tx-gain-db=0` — RX and TX gain trims in dB
 - `--buffer-ms=40` — RX jitter buffer target in ms
 - `--silence-threshold=2` / `--tx-hold-ms=100` — TX audio gate peak threshold and hold tail
-- `--tx-cat-on-audio=true` — Key `TX;`/`RX;` over `:9205` on TX audio (required for K4 `:9205` remote TX audio; set WSJT-X `PTT Method` to `VOX` while keeping CAT on `:9200`)
+- `--tx-cat-on-audio=false` — Key `TX;`/`RX;` over `:9205` on TX audio (keep `false` when WSJT-X keys via CAT; set `true` if using WSJT-X `PTT=VOX`)
 - `--backend=auto` — Audio backend (`auto`, `pulse`, `pw-cat`, `mock`)
 - `--rx-node=k4_rx` / `--tx-node=k4_tx` / `--no-ephemeral-nodes=false` — PipeWire node configuration
 - `--once=false` / `--log-levels=false` — Disable reconnect or log periodic level/buffer stats
@@ -73,9 +73,8 @@ In `wsjtx-improved`:
 - **Settings -> Radio**:
   - **Rig**: `Elecraft K4`
   - **CAT Control -> Network Server**: `<k4-ip>:9200`
-  - **PTT Method**: `VOX` (`k4-audio` keys `TX;`/`RX;` over `:9205` on TX audio so K4 routes network audio to the modulator)
+  - **PTT Method**: `CAT`
   - **Mode**: `Data/Pkt`
-  - **Split Operation**: `Fake It` (or `Rig`)
 - **Settings -> Audio**:
   - **Input**: `k4_rx` (`Elecraft K4 RX`) — select **`Left`** (Main RX) or **`Right`** (Sub RX)
   - **Output**: `k4_tx` (`Elecraft K4 TX`)

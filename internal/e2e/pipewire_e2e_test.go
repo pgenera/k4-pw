@@ -111,6 +111,7 @@ func allocFreeLoopbackAddr(t *testing.T) (string, int) {
 func startManagedProcess(t *testing.T, name string, args ...string) (*exec.Cmd, <-chan error, *syncBuffer) {
 	t.Helper()
 	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out := &syncBuffer{}
 	cmd.Stdout = out
 	cmd.Stderr = out
@@ -129,7 +130,7 @@ func startManagedProcess(t *testing.T, name string, args ...string) (*exec.Cmd, 
 		default:
 		}
 		if cmd.Process != nil {
-			_ = cmd.Process.Signal(os.Interrupt)
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
 		}
 		select {
 		case <-waitCh:
@@ -137,7 +138,7 @@ func startManagedProcess(t *testing.T, name string, args ...string) (*exec.Cmd, 
 		case <-time.After(2 * time.Second):
 		}
 		if cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGKILL)
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		<-waitCh
 	})
