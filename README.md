@@ -1,32 +1,45 @@
 # k4-pw
 
-Headless PipeWire virtual audio bridge connecting an Elecraft K4 (`:9205`) directly to digital-mode software such as `wsjtx-improved`.
+Headless PipeWire virtual audio + CAT bridge connecting an Elecraft K4 (`:9205`) directly to digital-mode software such as `wsjtx-improved`.
 
-While `k4-audio` is running, it creates two ephemeral PipeWire virtual audio devices:
+`k4-pw` exposes two virtual PipeWire audio devices and a local CAT listener (`127.0.0.1:9200`) multiplexed over a **single** K4 `:9205` TCP session:
 - **`Elecraft K4 RX`** (`k4_rx`, `Audio/Source/Virtual`) — Stereo 12 kHz RX audio from the K4 (`Left` = Main RX, `Right` = Sub RX)
-- **`Elecraft K4 TX`** (`k4_tx`, `Audio/Sink`) — TX audio input sent to the K4
-
-When `k4-audio` exits (or `wsjtx` closes via `scripts/k4-wsjtx`), the ephemeral PipeWire nodes are automatically removed.
+- **`Elecraft K4 TX`** (`k4_tx`, `Audio/Sink`) — TX audio input sent to the K4 (`DAP` network modulator)
+- **`127.0.0.1:9200`** — Hamlib-compatible CAT + PTT proxy over `:9205` (uses only 1 client slot on the K4 and routes `:9205` TX audio when WSJT-X keys PTT via CAT)
 
 ## Prerequisites
 
-1. Install `wsjtx-improved` and PipeWire CLI utilities:
+1. Install Go (`>= 1.21`), `wsjtx-improved`, PipeWire CLI tools, and PulseAudio simple client library:
    ```bash
-   sudo apt install wsjtx-improved pipewire-utils
+   sudo apt install golang-go wsjtx-improved pipewire-utils libpulse0
    ```
-2. On the **Elecraft K4**, ensure multiple concurrent TCP clients are permitted:
-   - **`CONFIG` -> `TCP/IP` -> `Max Clients >= 2`** (use `>= 3` if also running a Web UI simultaneously: `:9200` for WSJT-X CAT + `:9205` for `k4-audio` + Web UI).
+2. On the **Elecraft K4**, if you also plan to run another remote client (such as `k4-js` Web UI) at the same time:
+   - **`CONFIG` -> `TCP/IP` -> `Max Clients >= 2`**.
 
-## Configuration
+## One-Step Install (On-Demand `systemd` Socket + Static PipeWire Nodes)
 
-Create `~/.config/k4-audio/config.env` from the example template:
+Run `./scripts/install.sh` to build `bin/k4-audio`, install low-priority static `k4_rx` / `k4_tx` PipeWire nodes, and enable `k4-audio.socket` on `127.0.0.1:9200`:
+
+```bash
+./scripts/install.sh --host <k4-hostname-or-ip> --password <k4-password>
+```
+
+How it works once installed:
+1. **`50-k4-audio.conf`** registers `k4_rx` and `k4_tx` in PipeWire at priority `100` (suspended at `0%` CPU when idle, never overriding your default desktop mic/speakers) so WSJT-X always finds its configured audio devices at startup — even when the K4 is powered off.
+2. **`k4-audio.socket`** listens passively on `127.0.0.1:9200` (`0%` CPU, `0` LAN traffic while WSJT-X is closed) and starts `k4-audio.service` automatically the moment WSJT-X connects.
+3. **Auto-shutdown**: `20s` after WSJT-X closes (or `20s` after failing fast if the K4 is powered off), `k4-audio` sends `RRN;` and exits cleanly, handing `127.0.0.1:9200` back to `systemd`.
+
+## Manual Configuration
+
+If configuring manually instead of via `./scripts/install.sh`, create `~/.config/k4-audio/config.env` (`0600` permissions):
 
 ```bash
 mkdir -p ~/.config/k4-audio
 cp configs/config.env.example ~/.config/k4-audio/config.env
+chmod 600 ~/.config/k4-audio/config.env
 ```
 
-Edit `~/.config/k4-audio/config.env` and set `K4_HOST` (and `K4_PASSWORD` or `K4_PASSWORD_FILE` if your K4 requires a network password).
+Edit `~/.config/k4-audio/config.env` and set `K4_HOST` (and `K4_PASSWORD` or `K4_PASSWORD_FILE`).
 
 ## Quick Start (`k4-wsjtx`)
 
@@ -83,9 +96,9 @@ In `wsjtx-improved`:
 
 ## Running Alongside `k4-js` Web UI
 
-With `Max Clients >= 2` (or `>= 3` alongside WSJT-X CAT), `k4-audio` can run concurrently with the `k4-js` Web UI:
+Because `k4-audio` multiplexes both WSJT-X CAT and audio over a single `:9205` connection, running alongside `k4-js` Web UI only requires **`Max Clients >= 2`** on the K4:
 - Keep the Web UI audio codec on its default `EM1` (12 kHz PCM) rather than Opus (`EM2`/`EM3`), and avoid holding Web UI PTT while `wsjtx` is transmitting. (Leaving Web UI audio set to **`Audio Off`** is also convenient if you do not want FT8 audio playing through your desktop speakers.)
-- Use `wsjtx-improved` on `:9200` for CAT/PTT and `k4-audio` on `:9205` for audio.
+- Point WSJT-X at `127.0.0.1:9200` (local `k4-audio` CAT proxy) as usual.
 
 ## On-Demand `systemd --user` Socket Activation (Recommended)
 
@@ -98,7 +111,9 @@ With `configs/50-k4-audio.conf` and `configs/k4-audio.socket`, no background `k4
 mkdir -p ~/.config/pipewire/pipewire.conf.d ~/.config/systemd/user
 cp configs/50-k4-audio.conf ~/.config/pipewire/pipewire.conf.d/
 cp configs/k4-audio.socket configs/k4-audio.service ~/.config/systemd/user/
-systemctl --user restart pipewire pipewire-pulse wireplumber
+# Create nodes in the live session without restarting PipeWire (50-k4-audio.conf loads on future logins):
+pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name="k4_rx" node.description="Elecraft K4 RX" media.class="Audio/Source/Virtual" audio.position="FL,FR" monitor.passthrough=true priority.driver=100 priority.session=100 object.linger=true }'
+pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name="k4_tx" node.description="Elecraft K4 TX" media.class="Audio/Sink" audio.position="FL,FR" priority.driver=100 priority.session=100 object.linger=true }'
 systemctl --user daemon-reload
 systemctl --user enable --now k4-audio.socket
 ```
