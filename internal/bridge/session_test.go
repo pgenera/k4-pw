@@ -805,3 +805,121 @@ func TestSessionGainsLogLevelsEmptyPongAndBackoff(t *testing.T) {
 		}
 	}
 }
+
+func TestCATProxyMultiplexesAllCATOver9205(t *testing.T) {
+	srv9205 := newFakeK4Server(t)
+
+	eng := audio.NewMockEngine(k4proto.FrameSamples20ms)
+	defer eng.Close()
+
+	sess := NewSession(Config{
+		Host:           srv9205.host,
+		Port:           srv9205.port,
+		PassthroughCAT: true,
+	}, eng, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- sess.Run(ctx) }()
+
+	fc := srv9205.acceptConn(t, 2*time.Second)
+	// Trigger immediate passthrough bootstrap (ER1;AI0;K40;EM1;SL0;) via an audio frame.
+	if err := fc.sendAudio(0, k4proto.EncodeModePCM16, k4proto.FrameSamples20ms, make([]byte, k4proto.FrameSamples20ms*4)); err != nil {
+		t.Fatalf("sendAudio: %v", err)
+	}
+	_, boot := waitForCATPacket(t, fc, time.Second)
+	if boot != "ER1;AI0;K40;EM1;SL0;" {
+		t.Fatalf("passthrough bootstrap = %q, want %q", boot, "ER1;AI0;K40;EM1;SL0;")
+	}
+
+	proxy, err := StartCATProxy(ctx, CATProxyConfig{
+		ListenAddr: "127.0.0.1:0",
+	}, sess, nil)
+	if err != nil {
+		t.Fatalf("StartCATProxy: %v", err)
+	}
+	defer proxy.Close()
+
+	client, err := net.DialTimeout("tcp", proxy.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+
+	// Send Hamlib sequence "ID;IF;TX;TQ;" -> ALL commands arrive on :9205!
+	if _, err := client.Write([]byte("ID;IF;TX;TQ;")); err != nil {
+		t.Fatalf("write proxy: %v", err)
+	}
+	var got9205 []string
+	for len(got9205) < 4 {
+		_, c := waitForCATPacket(t, fc, time.Second)
+		if strings.HasPrefix(c, "PING") {
+			continue
+		}
+		got9205 = append(got9205, c)
+	}
+	want9205 := []string{"ID;", "IF;", "TX;", "TQ;"}
+	for i := range want9205 {
+		if got9205[i] != want9205[i] {
+			t.Fatalf("9205 cmd[%d] = %q, want %q", i, got9205[i], want9205[i])
+		}
+	}
+
+	// K4 :9205 replies with 38-byte IF (preserving trailing space!), PONG; (filtered), DAPM (filtered), and TQ1;.
+	wantIF := "IF00014074000     +000000 0016000001 ;"
+	if err := fc.sendCAT("ID017;" + wantIF + "PONG;DAPM0001800000011;TQ1;"); err != nil {
+		t.Fatalf("sendCAT reply: %v", err)
+	}
+
+	replyBuf := make([]byte, 256)
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	var gotReply string
+	wantReply := "ID017;" + wantIF + "TQ1;"
+	for len(gotReply) < len(wantReply) {
+		n, rerr := client.Read(replyBuf)
+		if n > 0 {
+			gotReply += string(replyBuf[:n])
+		}
+		if rerr != nil {
+			t.Fatalf("read proxy reply (%q): %v", gotReply, rerr)
+		}
+	}
+	if gotReply != wantReply {
+		t.Fatalf("proxy reply = %q, want %q", gotReply, wantReply)
+	}
+
+	// Send RX; and verify residual PipeWire tail frame is suppressed immediately after RX; while DA0; is filtered.
+	if _, err := client.Write([]byte("RX;")); err != nil {
+		t.Fatalf("write RX;: %v", err)
+	}
+	for {
+		_, c := waitForCATPacket(t, fc, time.Second)
+		if strings.HasPrefix(c, "PING") {
+			continue
+		}
+		if c != "RX;" {
+			t.Fatalf("expected RX; on :9205, got %q", c)
+		}
+		break
+	}
+	if err := fc.sendCAT("DA0;"); err != nil {
+		t.Fatalf("send DA0;: %v", err)
+	}
+
+	prevFrames := eng.Stats().TxFramesIn
+	eng.QueueTx(makeStereoFrame(k4proto.FrameSamples20ms, 12000, 12000))
+	waitUntil(t, time.Second, "tail frame consumed", func() bool {
+		return eng.Stats().TxFramesIn > prevFrames
+	})
+	select {
+	case pkt := <-fc.pkts:
+		if _, _, isAudio := k4proto.ParseAudioPayload(pkt.payload); isAudio {
+			t.Fatalf("unexpected residual audio packet sent after proxy RX;: %x", pkt.payload)
+		}
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	cancel()
+	<-runDone
+}

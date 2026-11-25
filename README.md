@@ -57,6 +57,7 @@ Check whether PipeWire nodes are active and print the WSJT-X setup summary:
 
 All `~/.config/k4-audio/config.env` settings can be overridden via CLI flags:
 - `--host` / `--port=9205` — K4 IP/hostname and remote audio port
+- `--cat-listen=127.0.0.1:9200` — Local TCP CAT listener for WSJT-X (multiplexes all CAT + `TX;`/`RX;` over the single `:9205` session so the K4 modulates from `:9205` network audio and only uses 1 K4 client slot)
 - `--password` / `--password-file` — K4 network password (SHA-384 auth)
 - `--rx-gain-db=0` / `--tx-gain-db=0` — RX and TX gain trims in dB
 - `--buffer-ms=40` — RX jitter buffer target in ms
@@ -72,7 +73,7 @@ In `wsjtx-improved`:
 
 - **Settings -> Radio**:
   - **Rig**: `Elecraft K4`
-  - **CAT Control -> Network Server**: `<k4-ip>:9200`
+  - **CAT Control -> Network Server**: `127.0.0.1:9200` (multiplexes CAT and PTT over `k4-audio`'s `:9205` session so K4 routes network TX audio to its modulator)
   - **PTT Method**: `CAT`
   - **Mode**: `Data/Pkt`
 - **Settings -> Audio**:

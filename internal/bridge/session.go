@@ -30,6 +30,7 @@ const (
 	shutdownWriteTimeout    = 500 * time.Millisecond
 	readBufferSize          = 32 * 1024
 	bootstrapCAT            = "RDY;K41;ER1;AI5;EM1;SL0;TQ;"
+	bootstrapCATPassthrough = "ER1;AI0;K40;EM1;SL0;"
 )
 
 // Config configures a K4 TCP audio/CAT bridge session on port 9205.
@@ -42,6 +43,7 @@ type Config struct {
 	SilenceThreshold int16
 	TxHoldTail       time.Duration
 	TxCatOnAudio     bool
+	PassthroughCAT   bool
 	Reconnect        bool
 	LogLevels        bool
 	DialTimeout      time.Duration
@@ -72,6 +74,11 @@ type SessionStats struct {
 	K4TxActive  bool
 }
 
+type clientCATReq struct {
+	raw  string
+	done chan error
+}
+
 // Session bridges stereo audio between a local audio.Engine and a K4 TCP :9205 endpoint.
 type Session struct {
 	cfg    Config
@@ -83,6 +90,11 @@ type Session struct {
 	rxAudioPkts atomic.Uint64
 	txAudioPkts atomic.Uint64
 	k4TxActive  atomic.Bool
+
+	clientCATCh chan clientCATReq
+
+	catSinkMu sync.RWMutex
+	catSink   func(string)
 
 	pingMu           sync.Mutex
 	pendingPingToken string
@@ -96,9 +108,48 @@ func NewSession(cfg Config, eng audio.Engine, logger *log.Logger) *Session {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Session{
-		cfg:    cfg.withDefaults(),
-		eng:    eng,
-		logger: logger,
+		cfg:         cfg.withDefaults(),
+		eng:         eng,
+		logger:      logger,
+		clientCATCh: make(chan clientCATReq),
+	}
+}
+
+// SetCATReplySink registers an optional callback that receives non-internal CAT replies from :9205.
+func (s *Session) SetCATReplySink(fn func(string)) {
+	s.catSinkMu.Lock()
+	s.catSink = fn
+	s.catSinkMu.Unlock()
+}
+
+// SendClientCAT sends a raw semicolon-terminated CAT command (e.g. from Hamlib/WSJT-X)
+// over the active :9205 connection, updating TX audio gating when TX;/RX; is sent.
+func (s *Session) SendClientCAT(ctx context.Context, rawCmd string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req := clientCATReq{
+		raw:  rawCmd,
+		done: make(chan error, 1),
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case s.clientCATCh <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return errors.New("bridge: timed out waiting for active :9205 session")
+	}
+
+	select {
+	case err := <-req.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return errors.New("bridge: timed out completing :9205 CAT write")
 	}
 }
 
@@ -285,14 +336,16 @@ func (s *Session) runConn(
 	defer holdTimer.Stop()
 
 	var (
-		activeTxCh   <-chan []int16
-		bootstrapped bool
-		gotPacket    bool
-		audioTxKeyed bool
-		holdUntil    time.Time
-		txSeq        uint8
-		txEM1Scratch = make([]byte, 0, k4proto.FrameSamples20ms*4)
-		txFrameCount uint64
+		activeTxCh         <-chan []int16
+		bootstrapped       bool
+		gotPacket          bool
+		audioTxKeyed       bool
+		proxyTxKeyed       bool
+		holdUntil          time.Time
+		suppressAudioUntil time.Time
+		txSeq              uint8
+		txEM1Scratch       = make([]byte, 0, k4proto.FrameSamples20ms*4)
+		txFrameCount       uint64
 	)
 
 	sendBootstrap := func() error {
@@ -300,7 +353,11 @@ func (s *Session) runConn(
 			return nil
 		}
 		bootstrapTimer.Stop()
-		if err := writePacket(conn, k4proto.EncodeCAT(bootstrapCAT), writeTimeout); err != nil {
+		bootStr := bootstrapCAT
+		if s.cfg.PassthroughCAT {
+			bootStr = bootstrapCATPassthrough
+		}
+		if err := writePacket(conn, k4proto.EncodeCAT(bootStr), writeTimeout); err != nil {
 			return fmt.Errorf("bridge bootstrap write: %w", err)
 		}
 		bootstrapped = true
@@ -309,9 +366,10 @@ func (s *Session) runConn(
 	}
 
 	gracefulClose := func() {
-		if audioTxKeyed {
+		if audioTxKeyed || proxyTxKeyed {
 			_ = writePacket(conn, k4proto.EncodeCAT("RX;"), shutdownWriteTimeout)
 			audioTxKeyed = false
+			proxyTxKeyed = false
 			s.k4TxActive.Store(false)
 		}
 		_ = writePacket(conn, k4proto.EncodeCAT("RRN;"), shutdownWriteTimeout)
@@ -372,6 +430,37 @@ func (s *Session) runConn(
 				return isEstablished(), nil, fmt.Errorf("bridge ping write: %w", err)
 			}
 
+		case req := <-s.clientCATCh:
+			if err := sendBootstrap(); err != nil {
+				req.done <- err
+				abortClose()
+				return isEstablished(), nil, err
+			}
+			cmdUpper := strings.ToUpper(strings.TrimSpace(strings.TrimSuffix(req.raw, ";")))
+			// Suppress Hamlib's ER0; if ever sent, and map TX0/TX1/TX cleanly while forwarding all CAT on :9205.
+			outRaw := req.raw
+			if isPTTKeyCmd(cmdUpper) {
+				outRaw = "TX;"
+				suppressAudioUntil = time.Time{}
+				proxyTxKeyed = true
+				s.k4TxActive.Store(true)
+			} else if isPTTUnkeyCmd(cmdUpper) {
+				outRaw = "RX;"
+				proxyTxKeyed = false
+				audioTxKeyed = false
+				holdUntil = time.Time{}
+				holdTimer.Stop()
+				s.k4TxActive.Store(false)
+				suppressAudioUntil = time.Now().Add(300 * time.Millisecond)
+			}
+			if err := writePacket(conn, k4proto.EncodeCAT(outRaw), writeTimeout); err != nil {
+				werr := fmt.Errorf("bridge client CAT write: %w", err)
+				req.done <- werr
+				abortClose()
+				return isEstablished(), nil, werr
+			}
+			req.done <- nil
+
 		case <-holdTimer.C:
 			if !audioTxKeyed {
 				continue
@@ -427,8 +516,11 @@ func (s *Session) runConn(
 				}
 			}
 
-			k4Tx := s.k4TxActive.Load()
+			k4Tx := proxyTxKeyed || s.k4TxActive.Load()
 			shouldSend := audioActive || withinHold || k4Tx
+			if !suppressAudioUntil.IsZero() && now.Before(suppressAudioUntil) {
+				shouldSend = false
+			}
 			if shouldSend && len(em1Bytes) > 0 {
 				pkt := k4proto.EncodeAudioPacket(txSeq, k4proto.EncodeModePCM16, k4proto.FrameSamples20ms, em1Bytes)
 				if err := writePacket(conn, pkt, writeTimeout); err != nil {
@@ -525,6 +617,42 @@ func parseIFTxState(frame string) (tx bool, ok bool) {
 	return false, false
 }
 
+func isInternalBridgeCAT(trimmedFrame string) bool {
+	return strings.HasPrefix(trimmedFrame, "PONG") ||
+		strings.HasPrefix(trimmedFrame, "DAPM") ||
+		trimmedFrame == "DA0" ||
+		strings.HasPrefix(trimmedFrame, "MEDF") ||
+		strings.HasPrefix(trimmedFrame, "SIFP") ||
+		strings.HasPrefix(trimmedFrame, "SICP") ||
+		strings.HasPrefix(trimmedFrame, "SIRF") ||
+		strings.HasPrefix(trimmedFrame, "SIDA") ||
+		strings.HasPrefix(trimmedFrame, "SIDD") ||
+		strings.HasPrefix(trimmedFrame, "SIDU") ||
+		strings.HasPrefix(trimmedFrame, "SIRC") ||
+		strings.HasPrefix(trimmedFrame, "SID0")
+}
+
+// filterClientCATReplies preserves exact untrimmed CAT segments (such as 38-byte IF... ; frames)
+// while stripping internal :9205 keepalive/DAP/telemetry frames (PONG, DAPM, DA0, MEDF, SI*).
+func filterClientCATReplies(catText string) string {
+	var b strings.Builder
+	i := 0
+	n := len(catText)
+	for i < n {
+		semi := strings.IndexByte(catText[i:], ';')
+		if semi < 0 {
+			break
+		}
+		seg := catText[i : i+semi+1]
+		trimmed := strings.TrimSpace(catText[i : i+semi])
+		if trimmed != "" && !isInternalBridgeCAT(trimmed) {
+			b.WriteString(seg)
+		}
+		i += semi + 1
+	}
+	return b.String()
+}
+
 func (s *Session) handleCAT(catText string) {
 	frames := k4proto.SplitCATFrames(catText)
 	for _, frame := range frames {
@@ -539,6 +667,15 @@ func (s *Session) handleCAT(catText string) {
 			}
 		case strings.HasPrefix(frame, "PONG"):
 			s.recordPong(strings.TrimPrefix(frame, "PONG"))
+		}
+	}
+
+	s.catSinkMu.RLock()
+	sink := s.catSink
+	s.catSinkMu.RUnlock()
+	if sink != nil {
+		if forwarded := filterClientCATReplies(catText); forwarded != "" {
+			sink(forwarded)
 		}
 	}
 }

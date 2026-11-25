@@ -25,6 +25,7 @@ import (
 type cliConfig struct {
 	Host             string
 	Port             int
+	CatListen        string
 	Password         string
 	PasswordFile     string
 	RxGainDb         float64
@@ -131,6 +132,7 @@ func parseEnvLine(line string) (key, val string, ok bool, err error) {
 var envKeys = []string{
 	"K4_HOST",
 	"K4_PORT",
+	"K4_CAT_LISTEN",
 	"K4_PASSWORD",
 	"K4_PASSWORD_FILE",
 	"K4_RX_GAIN_DB",
@@ -173,6 +175,8 @@ func applyConfigKey(key, val string, cfg *cliConfig, allowUnprefixed bool) error
 			return err
 		}
 		cfg.Port = n
+	case "K4_CAT_LISTEN":
+		cfg.CatListen = val
 	case "K4_PASSWORD":
 		cfg.Password = val
 	case "K4_PASSWORD_FILE":
@@ -301,14 +305,18 @@ func validateConfig(cfg cliConfig) error {
 	return nil
 }
 
-func printWSJTXSummary(w io.Writer, host, rxNode, txNode string) {
+func printWSJTXSummary(w io.Writer, host, catListen, rxNode, txNode string) {
 	pwDef := pipewire.DefaultConfig()
-	targetHost := strings.TrimSpace(host)
-	if targetHost == "" {
-		targetHost = "<k4-ip>"
+	serverAddr := strings.TrimSpace(catListen)
+	if serverAddr == "" {
+		targetHost := strings.TrimSpace(host)
+		if targetHost == "" {
+			targetHost = "<k4-ip>"
+		}
+		serverAddr = targetHost + ":9200"
 	}
 	fmt.Fprintln(w, "wsjtx-improved configuration:")
-	fmt.Fprintf(w, "  Radio: Rig=Elecraft K4, Network Server=%s:9200, PTT=CAT, Mode=Data/Pkt\n", targetHost)
+	fmt.Fprintf(w, "  Radio: Rig=Elecraft K4, Network Server=%s, PTT=CAT, Mode=Data/Pkt\n", serverAddr)
 	fmt.Fprintf(w, "  Audio Input:  %s (%s) -> Left (Main RX) or Right (Sub RX)\n", rxNode, pwDef.RxDescription)
 	fmt.Fprintf(w, "  Audio Output: %s (%s)\n", txNode, pwDef.TxDescription)
 }
@@ -357,7 +365,7 @@ func runCheck(args []string) int {
 	fmt.Printf("PipeWire nodes:\n")
 	fmt.Printf("  RX (%s): %s\n", cfg.RxNode, statusLabel(rxOK))
 	fmt.Printf("  TX (%s): %s\n", cfg.TxNode, statusLabel(txOK))
-	printWSJTXSummary(os.Stdout, cfg.Host, cfg.RxNode, cfg.TxNode)
+	printWSJTXSummary(os.Stdout, cfg.Host, cfg.CatListen, cfg.RxNode, cfg.TxNode)
 
 	if !rxOK || !txOK {
 		return 1
@@ -407,6 +415,7 @@ func runBridge(ctx context.Context, cfg cliConfig, logger *log.Logger) error {
 	logger.Printf("audio engine ready: rx_backend=%s tx_backend=%s buffer_ms=%d",
 		st.RxBackend, st.TxBackend, cfg.BufferMs)
 
+	catListenAddr := strings.TrimSpace(cfg.CatListen)
 	sessCfg := bridge.Config{
 		Host:             cfg.Host,
 		Port:             cfg.Port,
@@ -416,12 +425,28 @@ func runBridge(ctx context.Context, cfg cliConfig, logger *log.Logger) error {
 		SilenceThreshold: int16(cfg.SilenceThreshold),
 		TxHoldTail:       time.Duration(cfg.TxHoldMs) * time.Millisecond,
 		TxCatOnAudio:     cfg.TxCatOnAudio,
+		PassthroughCAT:   catListenAddr != "",
 		Reconnect:        !cfg.Once,
 		LogLevels:        cfg.LogLevels,
 		DialTimeout:      5 * time.Second,
 	}
 
 	sess := bridge.NewSession(sessCfg, eng, logger)
+
+	if catListenAddr != "" {
+		catProxy, err := bridge.StartCATProxy(ctx, bridge.CATProxyConfig{
+			ListenAddr: catListenAddr,
+		}, sess, logger)
+		if err != nil {
+			return fmt.Errorf("start cat proxy: %w", err)
+		}
+		logger.Printf("cat proxy ready: listen=%s -> %s:%d (all CAT + audio multiplexed over single :%d session)",
+			catProxy.Addr().String(), cfg.Host, cfg.Port, cfg.Port)
+		defer func() {
+			_ = catProxy.Close()
+		}()
+	}
+
 	err = sess.Run(ctx)
 	if err != nil && errors.Is(err, context.Canceled) && ctx.Err() != nil {
 		return nil
@@ -444,6 +469,7 @@ func runMain(args []string) int {
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&cfg.Host, "host", cfg.Host, "Elecraft K4 IP address or hostname")
 	fs.IntVar(&cfg.Port, "port", cfg.Port, "Elecraft K4 remote audio/CAT port")
+	fs.StringVar(&cfg.CatListen, "cat-listen", cfg.CatListen, "Local TCP listen address multiplexing WSJT-X CAT over :9205 (e.g. 127.0.0.1:9200)")
 	fs.StringVar(&cfg.Password, "password", cfg.Password, "Elecraft K4 network password")
 	fs.StringVar(&cfg.PasswordFile, "password-file", cfg.PasswordFile, "Path to file containing Elecraft K4 password")
 	fs.Float64Var(&cfg.RxGainDb, "rx-gain-db", cfg.RxGainDb, "RX audio gain trim in dB")
