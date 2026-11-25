@@ -954,3 +954,94 @@ func TestCATProxyMultiplexesAllCATOver9205(t *testing.T) {
 	cancel()
 	<-runDone
 }
+
+func TestCATProxyPreboundListenerIdleExitAndOfflineFastFail(t *testing.T) {
+	// 1. Offline K4 fast-fail check: pick an unused port that immediately refuses connections.
+	closedLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy: %v", err)
+	}
+	offlinePort := closedLn.Addr().(*net.TCPAddr).Port
+	_ = closedLn.Close()
+
+	eng := audio.NewMockEngine(k4proto.FrameSamples20ms)
+	defer eng.Close()
+
+	sess := NewSession(Config{
+		Host:           "127.0.0.1",
+		Port:           offlinePort,
+		PassthroughCAT: true,
+		Reconnect:      true,
+		DialTimeout:    300 * time.Millisecond,
+	}, eng, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- sess.Run(ctx) }()
+
+	// Pre-bind CAT listener (simulating systemd socket activation FD).
+	preLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen prebound: %v", err)
+	}
+	idleCh := make(chan struct{}, 1)
+	proxy, err := StartCATProxy(ctx, CATProxyConfig{
+		Listener:    preLn,
+		IdleTimeout: 120 * time.Millisecond,
+		OnIdle: func() {
+			select {
+			case idleCh <- struct{}{}:
+			default:
+			}
+			cancel()
+		},
+	}, sess, nil)
+	if err != nil {
+		t.Fatalf("StartCATProxy: %v", err)
+	}
+	defer proxy.Close()
+
+	// Wait briefly for first dial failure to mark K4 offline.
+	waitUntil(t, time.Second, "hasDialFailed true", func() bool {
+		return sess.hasDialFailed.Load()
+	})
+
+	// Second SendClientCAT while K4 is offline must fail fast (<50ms instead of 2.5s timeout).
+	t0 := time.Now()
+	if sendErr := sess.SendClientCAT(ctx, "PS;"); sendErr == nil {
+		t.Fatalf("expected error from SendClientCAT while K4 is offline")
+	}
+	if elapsed := time.Since(t0); elapsed > 100*time.Millisecond {
+		t.Fatalf("expected fast fail (<100ms) while K4 offline, took %v", elapsed)
+	}
+
+	// Connect a client to hold off idle shutdown longer than 120ms.
+	c1, err := net.DialTimeout("tcp", proxy.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	time.Sleep(180 * time.Millisecond)
+	select {
+	case <-idleCh:
+		t.Fatalf("OnIdle fired while client was still connected")
+	default:
+	}
+
+	// Disconnect last client -> OnIdle must fire after ~120ms and cancel Run().
+	_ = c1.Close()
+	select {
+	case <-idleCh:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for OnIdle after last client disconnected")
+	}
+
+	select {
+	case runErr := <-runDone:
+		if runErr != nil {
+			t.Fatalf("Run() error on idle cancel: %v", runErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Run() did not exit after OnIdle cancel")
+	}
+}

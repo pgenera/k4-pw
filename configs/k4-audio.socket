@@ -1,0 +1,20 @@
+# On-demand systemd user socket for the Elecraft K4 CAT + PipeWire audio bridge.
+# Listens passively on 127.0.0.1:9200 (0 CPU / 0 LAN traffic while idle) and
+# starts k4-audio.service automatically as soon as WSJT-X (or rigctl) connects.
+# When WSJT-X exits, k4-audio shuts down cleanly after K4_IDLE_TIMEOUT (20s).
+#
+# Install alongside configs/50-k4-audio.conf and configs/k4-audio.service:
+#   mkdir -p ~/.config/systemd/user
+#   cp configs/k4-audio.socket configs/k4-audio.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now k4-audio.socket
+
+[Unit]
+Description=Elecraft K4 CAT and Audio Bridge Socket (WSJT-X)
+
+[Socket]
+ListenStream=127.0.0.1:9200
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

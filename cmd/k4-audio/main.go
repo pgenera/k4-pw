@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -40,6 +41,8 @@ type cliConfig struct {
 	NoEphemeralNodes bool
 	Once             bool
 	LogLevels        bool
+	IdleTimeout      time.Duration
+	IdleTimeoutSet   bool
 }
 
 func defaultCLIConfig() cliConfig {
@@ -147,6 +150,7 @@ var envKeys = []string{
 	"K4_NO_EPHEMERAL_NODES",
 	"K4_ONCE",
 	"K4_LOG_LEVELS",
+	"K4_IDLE_TIMEOUT",
 }
 
 func applyProcessEnv(cfg *cliConfig) error {
@@ -241,8 +245,36 @@ func applyConfigKey(key, val string, cfg *cliConfig, allowUnprefixed bool) error
 			return err
 		}
 		cfg.LogLevels = b
+	case "K4_IDLE_TIMEOUT":
+		d, err := parseDurationOrSeconds(val)
+		if err != nil {
+			return err
+		}
+		cfg.IdleTimeout = d
+		cfg.IdleTimeoutSet = true
 	}
 	return nil
+}
+
+func parseDurationOrSeconds(val string) (time.Duration, error) {
+	v := strings.TrimSpace(val)
+	if v == "" || v == "0" {
+		return 0, nil
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0, fmt.Errorf("idle timeout must be >= 0 (got %d)", secs)
+		}
+		return time.Duration(secs) * time.Second, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("idle timeout must be >= 0 (got %s)", d)
+	}
+	return d, nil
 }
 
 func expandHomePath(p string) (string, error) {
@@ -373,25 +405,30 @@ func runCheck(args []string) int {
 	return 0
 }
 
-func runBridge(ctx context.Context, cfg cliConfig, logger *log.Logger) error {
+func runBridge(ctx context.Context, stop context.CancelFunc, cfg cliConfig, inheritedLn net.Listener, logger *log.Logger) error {
 	pwDef := pipewire.DefaultConfig()
 	if !cfg.NoEphemeralNodes {
-		nodes, err := pipewire.StartEphemeral(ctx, pipewire.Config{
-			RxName:        cfg.RxNode,
-			RxDescription: pwDef.RxDescription,
-			TxName:        cfg.TxNode,
-			TxDescription: pwDef.TxDescription,
-		})
-		if err != nil {
-			return fmt.Errorf("start pipewire nodes: %w", err)
-		}
-		logger.Printf("pipewire virtual nodes ready: rx=%s (%q) tx=%s (%q)",
-			cfg.RxNode, pwDef.RxDescription, cfg.TxNode, pwDef.TxDescription)
-		defer func() {
-			if cerr := nodes.Close(); cerr != nil {
-				logger.Printf("pipewire teardown error: %v", cerr)
+		rxExists, txExists, checkErr := pipewire.CheckNodesExist(cfg.RxNode, cfg.TxNode)
+		if checkErr == nil && rxExists && txExists {
+			logger.Printf("pipewire static nodes already present: rx=%s tx=%s", cfg.RxNode, cfg.TxNode)
+		} else {
+			nodes, err := pipewire.StartEphemeral(ctx, pipewire.Config{
+				RxName:        cfg.RxNode,
+				RxDescription: pwDef.RxDescription,
+				TxName:        cfg.TxNode,
+				TxDescription: pwDef.TxDescription,
+			})
+			if err != nil {
+				return fmt.Errorf("start pipewire nodes: %w", err)
 			}
-		}()
+			logger.Printf("pipewire virtual nodes ready: rx=%s (%q) tx=%s (%q)",
+				cfg.RxNode, pwDef.RxDescription, cfg.TxNode, pwDef.TxDescription)
+			defer func() {
+				if cerr := nodes.Close(); cerr != nil {
+					logger.Printf("pipewire teardown error: %v", cerr)
+				}
+			}()
+		}
 	}
 
 	eng, err := audio.Open(ctx, audio.Config{
@@ -416,6 +453,7 @@ func runBridge(ctx context.Context, cfg cliConfig, logger *log.Logger) error {
 		st.RxBackend, st.TxBackend, cfg.BufferMs)
 
 	catListenAddr := strings.TrimSpace(cfg.CatListen)
+	hasCATProxy := inheritedLn != nil || catListenAddr != ""
 	sessCfg := bridge.Config{
 		Host:             cfg.Host,
 		Port:             cfg.Port,
@@ -425,23 +463,30 @@ func runBridge(ctx context.Context, cfg cliConfig, logger *log.Logger) error {
 		SilenceThreshold: int16(cfg.SilenceThreshold),
 		TxHoldTail:       time.Duration(cfg.TxHoldMs) * time.Millisecond,
 		TxCatOnAudio:     cfg.TxCatOnAudio,
-		PassthroughCAT:   catListenAddr != "",
+		PassthroughCAT:   hasCATProxy,
 		Reconnect:        !cfg.Once,
 		LogLevels:        cfg.LogLevels,
-		DialTimeout:      5 * time.Second,
+		DialTimeout:      2 * time.Second,
 	}
 
 	sess := bridge.NewSession(sessCfg, eng, logger)
 
-	if catListenAddr != "" {
+	if hasCATProxy {
+		idleTimeout := cfg.IdleTimeout
+		if inheritedLn != nil && !cfg.IdleTimeoutSet {
+			idleTimeout = 20 * time.Second
+		}
 		catProxy, err := bridge.StartCATProxy(ctx, bridge.CATProxyConfig{
-			ListenAddr: catListenAddr,
+			ListenAddr:  catListenAddr,
+			Listener:    inheritedLn,
+			IdleTimeout: idleTimeout,
+			OnIdle:      stop,
 		}, sess, logger)
 		if err != nil {
 			return fmt.Errorf("start cat proxy: %w", err)
 		}
-		logger.Printf("cat proxy ready: listen=%s -> %s:%d (all CAT + audio multiplexed over single :%d session)",
-			catProxy.Addr().String(), cfg.Host, cfg.Port, cfg.Port)
+		logger.Printf("cat proxy ready: listen=%s -> %s:%d (socket_activated=%v idle_timeout=%s)",
+			catProxy.Addr().String(), cfg.Host, cfg.Port, inheritedLn != nil, idleTimeout)
 		defer func() {
 			_ = catProxy.Close()
 		}()
@@ -483,7 +528,9 @@ func runMain(args []string) int {
 	fs.StringVar(&cfg.TxNode, "tx-node", cfg.TxNode, "PipeWire TX virtual sink node name")
 	fs.BoolVar(&cfg.NoEphemeralNodes, "no-ephemeral-nodes", cfg.NoEphemeralNodes, "Do not create/destroy ephemeral PipeWire nodes")
 	fs.BoolVar(&cfg.Once, "once", cfg.Once, "Exit after first disconnect instead of reconnecting")
+	var idleTimeoutFlag string
 	fs.BoolVar(&cfg.LogLevels, "log-levels", cfg.LogLevels, "Log periodic RX/TX audio levels and buffer stats")
+	fs.StringVar(&idleTimeoutFlag, "idle-timeout", "", "Exit after 0 CAT clients for duration (e.g. 20s; defaults to 20s when systemd socket-activated)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage:")
 		fmt.Fprintln(os.Stderr, "  k4-audio [flags]")
@@ -510,8 +557,19 @@ func runMain(args []string) int {
 			pwOnCLI = true
 		case "password-file":
 			pwFileOnCLI = true
+		case "idle-timeout":
+			cfg.IdleTimeoutSet = true
 		}
 	})
+	if idleTimeoutFlag != "" {
+		d, err := parseDurationOrSeconds(idleTimeoutFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid --idle-timeout %q: %v\n", idleTimeoutFlag, err)
+			return 2
+		}
+		cfg.IdleTimeout = d
+		cfg.IdleTimeoutSet = true
+	}
 
 	password, err := resolvePassword(cfg, pwOnCLI, pwFileOnCLI)
 	if err != nil {
@@ -526,10 +584,17 @@ func runMain(args []string) int {
 	}
 
 	logger := log.New(os.Stderr, "k4-audio: ", log.LstdFlags)
+
+	inheritedLn, lnErr := claimSystemdListener()
+	if lnErr != nil {
+		logger.Printf("fatal: %v", lnErr)
+		return 1
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := runBridge(ctx, cfg, logger); err != nil {
+	if err := runBridge(ctx, stop, cfg, inheritedLn, logger); err != nil {
 		logger.Printf("fatal: %v", err)
 		return 1
 	}

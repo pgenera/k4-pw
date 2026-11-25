@@ -21,7 +21,7 @@ const (
 	defaultPort             = 9205
 	defaultSilenceThreshold = int16(2)
 	defaultTxHoldTail       = 100 * time.Millisecond
-	defaultDialTimeout      = 5 * time.Second
+	defaultDialTimeout      = 2 * time.Second
 	bootstrapDelay          = 250 * time.Millisecond
 	pingInterval            = 1 * time.Second
 	minBackoff              = 500 * time.Millisecond
@@ -85,13 +85,17 @@ type Session struct {
 	eng    audio.Engine
 	logger *log.Logger
 
-	connected   atomic.Bool
-	rttMs       atomic.Int64
-	rxAudioPkts atomic.Uint64
-	txAudioPkts atomic.Uint64
-	k4TxActive  atomic.Bool
+	connected     atomic.Bool
+	hasDialFailed atomic.Bool
+	rttMs         atomic.Int64
+	rxAudioPkts   atomic.Uint64
+	txAudioPkts   atomic.Uint64
+	k4TxActive    atomic.Bool
 
 	clientCATCh chan clientCATReq
+
+	dialFailMu sync.Mutex
+	dialFailCh chan struct{}
 
 	catSinkMu sync.RWMutex
 	catSink   func(string)
@@ -112,7 +116,23 @@ func NewSession(cfg Config, eng audio.Engine, logger *log.Logger) *Session {
 		eng:         eng,
 		logger:      logger,
 		clientCATCh: make(chan clientCATReq),
+		dialFailCh:  make(chan struct{}),
 	}
+}
+
+func (s *Session) notifyDialFailed() {
+	s.hasDialFailed.Store(true)
+	s.dialFailMu.Lock()
+	close(s.dialFailCh)
+	s.dialFailCh = make(chan struct{})
+	s.dialFailMu.Unlock()
+}
+
+func (s *Session) currentDialFailCh() <-chan struct{} {
+	s.dialFailMu.Lock()
+	ch := s.dialFailCh
+	s.dialFailMu.Unlock()
+	return ch
 }
 
 // SetCATReplySink registers an optional callback that receives non-internal CAT replies from :9205.
@@ -128,15 +148,21 @@ func (s *Session) SendClientCAT(ctx context.Context, rawCmd string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !s.connected.Load() && s.hasDialFailed.Load() {
+		return errors.New("bridge: K4 :9205 is offline")
+	}
 	req := clientCATReq{
 		raw:  rawCmd,
 		done: make(chan error, 1),
 	}
-	timer := time.NewTimer(2 * time.Second)
+	failCh := s.currentDialFailCh()
+	timer := time.NewTimer(2500 * time.Millisecond)
 	defer timer.Stop()
 
 	select {
 	case s.clientCATCh <- req:
+	case <-failCh:
+		return errors.New("bridge: K4 :9205 dial failed (radio off or unreachable)")
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
@@ -202,6 +228,7 @@ func (s *Session) Run(ctx context.Context) error {
 
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
+			s.notifyDialFailed()
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -309,6 +336,7 @@ func (s *Session) runConn(
 		return false, nil, fmt.Errorf("bridge auth write: %w", err)
 	}
 
+	s.hasDialFailed.Store(false)
 	s.connected.Store(true)
 	s.clearPendingPing()
 	defer func() {
@@ -345,6 +373,7 @@ func (s *Session) runConn(
 		txSeq        uint8
 		txEM1Scratch = make([]byte, 0, k4proto.FrameSamples20ms*4)
 		txFrameCount uint64
+		txBurstStart uint64
 	)
 
 	sendBootstrap := func() error {
@@ -361,6 +390,7 @@ func (s *Session) runConn(
 		}
 		bootstrapped = true
 		activeTxCh = txCh
+		s.logger.Printf("k4 session active: %s (passthrough_cat=%v)", conn.RemoteAddr(), s.cfg.PassthroughCAT)
 		return nil
 	}
 
@@ -444,12 +474,18 @@ func (s *Session) runConn(
 						fl.FlushTx()
 					}
 					drainPendingTx(activeTxCh, txBufPool)
+					txBurstStart = s.txAudioPkts.Load()
+					s.logger.Printf("cat ptt: TX; (keyed)")
 				}
 				holdUntil = time.Time{}
 				proxyTxKeyed = true
 				s.k4TxActive.Store(true)
 			} else if isPTTUnkeyCmd(cmdUpper) {
 				outRaw = "RX;"
+				if proxyTxKeyed {
+					sent := s.txAudioPkts.Load() - txBurstStart
+					s.logger.Printf("cat ptt: RX; (unkeyed, tx_audio_pkts=%d)", sent)
+				}
 				proxyTxKeyed = false
 				audioTxKeyed = false
 				holdUntil = time.Time{}

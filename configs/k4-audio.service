@@ -1,20 +1,14 @@
-# Manual-only systemd user unit for the Elecraft K4 PipeWire audio bridge.
-# Do NOT run `systemctl --user enable k4-audio` — virtual PipeWire nodes are
-# ephemeral and exist only while this service (or scripts/k4-wsjtx) runs.
-#
-# Install:
-#   mkdir -p ~/.config/systemd/user
-#   cp configs/k4-audio.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#
-# Usage:
-#   systemctl --user start k4-audio
-#   systemctl --user stop k4-audio
+# Systemd user service for the Elecraft K4 PipeWire Audio + CAT Bridge.
+# Activated on-demand by k4-audio.socket when WSJT-X connects to 127.0.0.1:9200
+# (or started manually via `systemctl --user start k4-audio.service`).
+# Exits cleanly with status 0 after K4_IDLE_TIMEOUT (default 20s when socket-activated)
+# once WSJT-X closes its CAT connection, handing 127.0.0.1:9200 back to systemd.
 
 [Unit]
 Description=Elecraft K4 PipeWire Audio Bridge
 After=pipewire.service pipewire-pulse.service
 Wants=pipewire.service pipewire-pulse.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

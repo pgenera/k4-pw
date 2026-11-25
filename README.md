@@ -64,7 +64,8 @@ All `~/.config/k4-audio/config.env` settings can be overridden via CLI flags:
 - `--silence-threshold=2` / `--tx-hold-ms=100` — TX audio gate peak threshold and hold tail
 - `--tx-cat-on-audio=false` — Key `TX;`/`RX;` over `:9205` on TX audio (keep `false` when WSJT-X keys via CAT; set `true` if using WSJT-X `PTT=VOX`)
 - `--backend=auto` — Audio backend (`auto`, `pulse`, `pw-cat`, `mock`)
-- `--rx-node=k4_rx` / `--tx-node=k4_tx` / `--no-ephemeral-nodes=false` — PipeWire node configuration
+- `--rx-node=k4_rx` / `--tx-node=k4_tx` / `--no-ephemeral-nodes=false` — PipeWire node configuration (if static nodes from `configs/50-k4-audio.conf` already exist, `k4-audio` reuses them automatically without tearing them down on exit)
+- `--idle-timeout` — Auto-exit after `0` CAT clients remain connected for the given duration (defaults to `20s` automatically when activated via `k4-audio.socket`; `0` disables)
 - `--once=false` / `--log-levels=false` — Disable reconnect or log periodic level/buffer stats
 
 ## WSJT-X (`wsjtx-improved`) Configuration
@@ -86,13 +87,24 @@ With `Max Clients >= 2` (or `>= 3` alongside WSJT-X CAT), `k4-audio` can run con
 - Keep the Web UI audio codec on its default `EM1` (12 kHz PCM) rather than Opus (`EM2`/`EM3`), and avoid holding Web UI PTT while `wsjtx` is transmitting. (Leaving Web UI audio set to **`Audio Off`** is also convenient if you do not want FT8 audio playing through your desktop speakers.)
 - Use `wsjtx-improved` on `:9200` for CAT/PTT and `k4-audio` on `:9205` for audio.
 
-## Optional Manual `systemd --user` Unit
+## On-Demand `systemd --user` Socket Activation (Recommended)
 
-`configs/k4-audio.service` is intentionally manual-only (no `[Install]` section) so PipeWire nodes do not persist when unused:
+With `configs/50-k4-audio.conf` and `configs/k4-audio.socket`, no background `k4-audio` process runs when WSJT-X is closed (`0%` CPU, `0` LAN traffic even when the K4 is powered off):
+1. `50-k4-audio.conf` registers low-priority (`100`) static `k4_rx` / `k4_tx` nodes in PipeWire so WSJT-X always finds its configured audio devices at startup without changing your desktop default mic/speakers.
+2. `k4-audio.socket` listens passively on `127.0.0.1:9200` and launches `k4-audio.service` on demand as soon as WSJT-X connects.
+3. When you close WSJT-X (or if the K4 is powered off and WSJT-X is idle at its Rig Control Error prompt), `k4-audio` exits cleanly `20s` after the last `:9200` client disconnects, handing `127.0.0.1:9200` back to `systemd`.
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp configs/k4-audio.service ~/.config/systemd/user/
+mkdir -p ~/.config/pipewire/pipewire.conf.d ~/.config/systemd/user
+cp configs/50-k4-audio.conf ~/.config/pipewire/pipewire.conf.d/
+cp configs/k4-audio.socket configs/k4-audio.service ~/.config/systemd/user/
+systemctl --user restart pipewire pipewire-pulse wireplumber
 systemctl --user daemon-reload
-systemctl --user start k4-audio
+systemctl --user enable --now k4-audio.socket
+```
+
+Follow live CAT/PTT/session events at any time with:
+
+```bash
+journalctl --user -u k4-audio -f
 ```
