@@ -507,7 +507,20 @@ func TestSessionTxGatingHoldTailCatOnAudioAndK4TxActive(t *testing.T) {
 	}
 	waitUntil(t, time.Second, "K4TxActive false via RX;", func() bool { return !sess.Stats().K4TxActive })
 
-	// Build an IF frame with index 25 = '1', then '0'.
+	// Build real K4 hardware IF frames (space at [25], TX flag at [28]) as well as compact synthetic frames.
+	ifHwTx := "IF00014074000     +000000 0016000001 ;"
+	if err := fc.sendCAT(ifHwTx); err != nil {
+		t.Fatalf("send real K4 IF TX: %v", err)
+	}
+	waitUntil(t, time.Second, "K4TxActive true via real K4 IF[28]", func() bool { return sess.Stats().K4TxActive })
+
+	ifHwRx := "IF00014074000     +000000 0006000001 ;"
+	if err := fc.sendCAT(ifHwRx); err != nil {
+		t.Fatalf("send real K4 IF RX: %v", err)
+	}
+	waitUntil(t, time.Second, "K4TxActive false via real K4 IF[28]", func() bool { return !sess.Stats().K4TxActive })
+
+	// Also verify compact synthetic IF frame with index 25 = '1', then '0'.
 	ifTx := "IF00014074000     +00000010003000000;"
 	if len(ifTx) <= 25 || ifTx[25] != '1' {
 		t.Fatalf("test bug: invalid IF TX frame %q", ifTx)
@@ -522,6 +535,44 @@ func TestSessionTxGatingHoldTailCatOnAudioAndK4TxActive(t *testing.T) {
 		t.Fatalf("send IF RX: %v", err)
 	}
 	waitUntil(t, time.Second, "K4TxActive false via IF[25]", func() bool { return !sess.Stats().K4TxActive })
+
+	// Real K4 AI5 echo behavior: K4 echoes TX; when TxCatOnAudio keys TX, and replies DA0; (not RX;) on RX;.
+	// Ensure unkeying immediately clears K4TxActive so silent frames do not keep streaming after RX;.
+	eng.QueueTx(makeStereoFrame(k4proto.FrameSamples20ms, 3200, 0))
+	_, txEchoTrig := waitForCATPacket(t, fc, time.Second)
+	if txEchoTrig != "TX;" {
+		t.Fatalf("expected TX;, got %q", txEchoTrig)
+	}
+	if err := fc.sendCAT("TX;"); err != nil {
+		t.Fatalf("send echoed TX;: %v", err)
+	}
+	select {
+	case <-fc.pkts:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for audio packet")
+	}
+	waitUntil(t, time.Second, "K4TxActive true after echoed TX;", func() bool { return sess.Stats().K4TxActive })
+
+	_, rxAfterEcho := waitForCATPacket(t, fc, time.Second)
+	if rxAfterEcho != "RX;" {
+		t.Fatalf("expected RX; after hold tail, got %q", rxAfterEcho)
+	}
+	if err := fc.sendCAT("DA0;"); err != nil {
+		t.Fatalf("send DA0;: %v", err)
+	}
+	if sess.Stats().K4TxActive {
+		t.Fatalf("expected K4TxActive=false immediately after TxCatOnAudio RX;")
+	}
+	prevFramesIn := eng.Stats().TxFramesIn
+	eng.QueueTx(makeStereoFrame(k4proto.FrameSamples20ms, 0, 0))
+	waitUntil(t, time.Second, "eng read silent frame after echoed TX;", func() bool {
+		return eng.Stats().TxFramesIn > prevFramesIn
+	})
+	select {
+	case pkt := <-fc.pkts:
+		t.Fatalf("unexpected TX packet after echoed TX; + RX; unkey: %x", pkt.payload)
+	case <-time.After(40 * time.Millisecond):
+	}
 
 	// 6. Trigger TxCatOnAudio again and cancel immediately before hold tail expires ->
 	// shutdown must emit RX; followed by RRN;.

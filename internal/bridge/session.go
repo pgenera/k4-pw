@@ -312,6 +312,7 @@ func (s *Session) runConn(
 		if audioTxKeyed {
 			_ = writePacket(conn, k4proto.EncodeCAT("RX;"), shutdownWriteTimeout)
 			audioTxKeyed = false
+			s.k4TxActive.Store(false)
 		}
 		_ = writePacket(conn, k4proto.EncodeCAT("RRN;"), shutdownWriteTimeout)
 		_ = conn.Close()
@@ -385,6 +386,7 @@ func (s *Session) runConn(
 				return isEstablished(), nil, fmt.Errorf("bridge tx-cat RX write: %w", err)
 			}
 			audioTxKeyed = false
+			s.k4TxActive.Store(false)
 
 		case pcm := <-activeTxCh:
 			em1Bytes, rms, peak := k4proto.EncodeTxStereoS16ToEM1(pcm, s.cfg.TxGainDb, txEM1Scratch)
@@ -421,6 +423,7 @@ func (s *Session) runConn(
 						return isEstablished(), nil, fmt.Errorf("bridge tx-cat RX write: %w", err)
 					}
 					audioTxKeyed = false
+					s.k4TxActive.Store(false)
 				}
 			}
 
@@ -499,19 +502,40 @@ func (s *Session) rxLoop(conn net.Conn, firstPacketCh chan struct{}, rxErrCh cha
 	}
 }
 
+func parseIFTxState(frame string) (tx bool, ok bool) {
+	// Standard Elecraft K3/K4 hardware IF format:
+	// "IF" (0..1) + 11-digit freq (2..12) + 5 spaces (13..17) + "+yyyy" (18..22) +
+	// RIT (23) + XIT (24) + " " (25) + "00" (26..27) + TX (28) + mode (29) ...
+	if len(frame) > 28 && frame[25] == ' ' {
+		switch frame[28] {
+		case '1':
+			return true, true
+		case '0':
+			return false, true
+		}
+	}
+	if len(frame) > 25 {
+		switch frame[25] {
+		case '1':
+			return true, true
+		case '0':
+			return false, true
+		}
+	}
+	return false, false
+}
+
 func (s *Session) handleCAT(catText string) {
 	frames := k4proto.SplitCATFrames(catText)
 	for _, frame := range frames {
 		switch {
-		case frame == "TQ1" || frame == "TX":
+		case frame == "TQ1" || frame == "TQX1" || frame == "TX":
 			s.k4TxActive.Store(true)
-		case frame == "TQ0" || frame == "RX":
+		case frame == "TQ0" || frame == "TQX0" || frame == "RX" || frame == "DA0":
 			s.k4TxActive.Store(false)
-		case strings.HasPrefix(frame, "IF") && len(frame) > 25:
-			if frame[25] == '1' {
-				s.k4TxActive.Store(true)
-			} else if frame[25] == '0' {
-				s.k4TxActive.Store(false)
+		case strings.HasPrefix(frame, "IF"):
+			if tx, ok := parseIFTxState(frame); ok {
+				s.k4TxActive.Store(tx)
 			}
 		case strings.HasPrefix(frame, "PONG"):
 			s.recordPong(strings.TrimPrefix(frame, "PONG"))
