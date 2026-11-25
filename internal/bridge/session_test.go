@@ -847,6 +847,20 @@ func TestCATProxyMultiplexesAllCATOver9205(t *testing.T) {
 	}
 	defer client.Close()
 
+	// Before TX;, loud pre-PTT audio on k4_tx must NOT emit unkeyed 0x01 packets.
+	prevPreTx := eng.Stats().TxFramesIn
+	eng.QueueTx(makeStereoFrame(k4proto.FrameSamples20ms, 30000, 30000))
+	waitUntil(t, time.Second, "pre-TX frame consumed", func() bool {
+		return eng.Stats().TxFramesIn > prevPreTx
+	})
+	select {
+	case pkt := <-fc.pkts:
+		if _, _, isAudio := k4proto.ParseAudioPayload(pkt.payload); isAudio {
+			t.Fatalf("unexpected pre-TX unkeyed 0x01 packet: %x", pkt.payload)
+		}
+	case <-time.After(30 * time.Millisecond):
+	}
+
 	// Send Hamlib sequence "ID;IF;TX;TQ;" -> ALL commands arrive on :9205!
 	if _, err := client.Write([]byte("ID;IF;TX;TQ;")); err != nil {
 		t.Fatalf("write proxy: %v", err)
@@ -889,7 +903,19 @@ func TestCATProxyMultiplexesAllCATOver9205(t *testing.T) {
 		t.Fatalf("proxy reply = %q, want %q", gotReply, wantReply)
 	}
 
-	// Send RX; and verify residual PipeWire tail frame is suppressed immediately after RX; while DA0; is filtered.
+	// While TX; is active, active audio frames are sent as 0x01 packets.
+	eng.QueueTx(makeStereoFrame(k4proto.FrameSamples20ms, 12000, 12000))
+	select {
+	case pkt := <-fc.pkts:
+		if _, _, isAudio := k4proto.ParseAudioPayload(pkt.payload); !isAudio {
+			t.Fatalf("expected 0x01 audio packet during active TX;, got %x", pkt.payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for 0x01 audio packet during active TX;")
+	}
+
+	// Send RX; -> emits RX; on :9205, filters DA0;, and permanently blocks any
+	// post-RX buffered PulseAudio tail frames (even >300ms later) until the next TX;.
 	if _, err := client.Write([]byte("RX;")); err != nil {
 		t.Fatalf("write RX;: %v", err)
 	}
@@ -907,9 +933,14 @@ func TestCATProxyMultiplexesAllCATOver9205(t *testing.T) {
 		t.Fatalf("send DA0;: %v", err)
 	}
 
+	// Even if K4 briefly reports TQ1; before settling, proxy RX; keeps 0x01 strictly off.
+	if err := fc.sendCAT("TQ1;"); err != nil {
+		t.Fatalf("send TQ1;: %v", err)
+	}
+	time.Sleep(350 * time.Millisecond)
 	prevFrames := eng.Stats().TxFramesIn
-	eng.QueueTx(makeStereoFrame(k4proto.FrameSamples20ms, 12000, 12000))
-	waitUntil(t, time.Second, "tail frame consumed", func() bool {
+	eng.QueueTx(makeStereoFrame(k4proto.FrameSamples20ms, 30000, 30000))
+	waitUntil(t, time.Second, "post-RX loud tail frame consumed", func() bool {
 		return eng.Stats().TxFramesIn > prevFrames
 	})
 	select {

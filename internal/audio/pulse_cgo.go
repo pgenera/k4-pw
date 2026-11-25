@@ -290,6 +290,14 @@ func (r *pulseSimpleReader) popBytesLocked(dst []byte) {
 	r.avail -= n
 }
 
+func (r *pulseSimpleReader) Flush() {
+	r.mu.Lock()
+	r.head = 0
+	r.tail = 0
+	r.avail = 0
+	r.mu.Unlock()
+}
+
 func (r *pulseSimpleReader) ReadFrames(dst []int16, frameSamples int) (int, error) {
 	needSamples := frameSamples * 2
 	needBytes := needSamples * 2

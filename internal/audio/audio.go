@@ -162,6 +162,12 @@ func (e *pipewireEngine) ReadTxStereo(dst []int16) (int, error) {
 	return frames, err
 }
 
+func (e *pipewireEngine) FlushTx() {
+	if fl, ok := e.txCap.(interface{ Flush() }); ok {
+		fl.Flush()
+	}
+}
+
 func (e *pipewireEngine) Stats() Stats {
 	buffered := e.rxRing.BufferedFrames()
 	return Stats{

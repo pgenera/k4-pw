@@ -336,16 +336,15 @@ func (s *Session) runConn(
 	defer holdTimer.Stop()
 
 	var (
-		activeTxCh         <-chan []int16
-		bootstrapped       bool
-		gotPacket          bool
-		audioTxKeyed       bool
-		proxyTxKeyed       bool
-		holdUntil          time.Time
-		suppressAudioUntil time.Time
-		txSeq              uint8
-		txEM1Scratch       = make([]byte, 0, k4proto.FrameSamples20ms*4)
-		txFrameCount       uint64
+		activeTxCh   <-chan []int16
+		bootstrapped bool
+		gotPacket    bool
+		audioTxKeyed bool
+		proxyTxKeyed bool
+		holdUntil    time.Time
+		txSeq        uint8
+		txEM1Scratch = make([]byte, 0, k4proto.FrameSamples20ms*4)
+		txFrameCount uint64
 	)
 
 	sendBootstrap := func() error {
@@ -437,11 +436,16 @@ func (s *Session) runConn(
 				return isEstablished(), nil, err
 			}
 			cmdUpper := strings.ToUpper(strings.TrimSpace(strings.TrimSuffix(req.raw, ";")))
-			// Suppress Hamlib's ER0; if ever sent, and map TX0/TX1/TX cleanly while forwarding all CAT on :9205.
 			outRaw := req.raw
 			if isPTTKeyCmd(cmdUpper) {
 				outRaw = "TX;"
-				suppressAudioUntil = time.Time{}
+				if !proxyTxKeyed {
+					if fl, ok := s.eng.(interface{ FlushTx() }); ok {
+						fl.FlushTx()
+					}
+					drainPendingTx(activeTxCh, txBufPool)
+				}
+				holdUntil = time.Time{}
 				proxyTxKeyed = true
 				s.k4TxActive.Store(true)
 			} else if isPTTUnkeyCmd(cmdUpper) {
@@ -451,7 +455,6 @@ func (s *Session) runConn(
 				holdUntil = time.Time{}
 				holdTimer.Stop()
 				s.k4TxActive.Store(false)
-				suppressAudioUntil = time.Now().Add(300 * time.Millisecond)
 			}
 			if err := writePacket(conn, k4proto.EncodeCAT(outRaw), writeTimeout); err != nil {
 				werr := fmt.Errorf("bridge client CAT write: %w", err)
@@ -517,9 +520,15 @@ func (s *Session) runConn(
 			}
 
 			k4Tx := proxyTxKeyed || s.k4TxActive.Load()
-			shouldSend := audioActive || withinHold || k4Tx
-			if !suppressAudioUntil.IsZero() && now.Before(suppressAudioUntil) {
-				shouldSend = false
+			var shouldSend bool
+			if s.cfg.PassthroughCAT && !s.cfg.TxCatOnAudio {
+				// In CAT-multiplexed mode (WSJT-X PTT=CAT), stream 20ms 0x01 audio frames
+				// strictly while PTT is explicitly keyed via TX;..RX; (matching k4-js txAudioAllowed).
+				// Never send 0x01 frames before TX; or after RX;, even while PulseAudio drains
+				// buffered tail audio, as unkeyed 0x01 frames trigger K4 DAPM replay and hold TQ1.
+				shouldSend = proxyTxKeyed
+			} else {
+				shouldSend = audioActive || withinHold || k4Tx
 			}
 			if shouldSend && len(em1Bytes) > 0 {
 				pkt := k4proto.EncodeAudioPacket(txSeq, k4proto.EncodeModePCM16, k4proto.FrameSamples20ms, em1Bytes)
@@ -711,6 +720,20 @@ func (s *Session) recordPong(token string) {
 		s.hasPendingPing = false
 	}
 	s.pingMu.Unlock()
+}
+
+func drainPendingTx(txCh <-chan []int16, pool chan<- []int16) {
+	if txCh == nil {
+		return
+	}
+	for {
+		select {
+		case pcm := <-txCh:
+			returnTxBuf(pool, pcm)
+		default:
+			return
+		}
+	}
 }
 
 func returnTxBuf(pool chan<- []int16, buf []int16) {
