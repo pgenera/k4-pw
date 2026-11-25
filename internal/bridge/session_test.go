@@ -1045,3 +1045,51 @@ func TestCATProxyPreboundListenerIdleExitAndOfflineFastFail(t *testing.T) {
 		t.Fatalf("Run() did not exit after OnIdle cancel")
 	}
 }
+
+func TestColdSocketActivatedCATWaitsForAuthBootstrap(t *testing.T) {
+	srv := newFakeK4Server(t)
+	eng := audio.NewMockEngine(k4proto.FrameSamples20ms)
+	defer eng.Close()
+
+	sess := NewSession(Config{
+		Host:           srv.host,
+		Port:           srv.port,
+		Password:       "spamcake42",
+		PassthroughCAT: true,
+	}, eng, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- sess.Run(ctx) }()
+
+	// Immediately enqueue PS; before :9205 has finished its 250ms post-auth bootstrap window
+	// (simulating systemd socket activation with WSJT-X's PS; already queued).
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- sess.SendClientCAT(ctx, "PS;")
+	}()
+
+	fc := srv.acceptConn(t, 2*time.Second)
+
+	// K4 stays quiet during SHA-384 auth verification: neither bootstrap nor PS; may arrive <200ms!
+	pkt1, cat1 := waitForCATPacket(t, fc, 2*time.Second)
+	if elapsed := pkt1.at.Sub(fc.authAt); elapsed < 200*time.Millisecond {
+		t.Fatalf("CAT sent too early during auth window (%v < 200ms): %q", elapsed, cat1)
+	}
+	if cat1 != "ER1;AI0;K40;EM1;SL0;" {
+		t.Fatalf("first CAT = %q, want passthrough bootstrap", cat1)
+	}
+
+	_, cat2 := waitForCATPacket(t, fc, time.Second)
+	if cat2 != "PS;" {
+		t.Fatalf("second CAT = %q, want PS;", cat2)
+	}
+
+	if err := <-sendDone; err != nil {
+		t.Fatalf("SendClientCAT(PS;): %v", err)
+	}
+
+	cancel()
+	<-runDone
+}

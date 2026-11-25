@@ -346,11 +346,12 @@ func (s *Session) runConn(
 	}()
 
 	firstPacketCh := make(chan struct{})
+	emFixCh := make(chan struct{}, 1)
 	rxErrCh := make(chan error, 1)
 	rxDone := make(chan struct{})
 	go func() {
 		defer close(rxDone)
-		s.rxLoop(conn, firstPacketCh, rxErrCh)
+		s.rxLoop(conn, firstPacketCh, emFixCh, rxErrCh)
 	}()
 
 	bootstrapTimer := time.NewTimer(bootstrapDelay)
@@ -364,16 +365,17 @@ func (s *Session) runConn(
 	defer holdTimer.Stop()
 
 	var (
-		activeTxCh   <-chan []int16
-		bootstrapped bool
-		gotPacket    bool
-		audioTxKeyed bool
-		proxyTxKeyed bool
-		holdUntil    time.Time
-		txSeq        uint8
-		txEM1Scratch = make([]byte, 0, k4proto.FrameSamples20ms*4)
-		txFrameCount uint64
-		txBurstStart uint64
+		activeTxCh        <-chan []int16
+		activeClientCATCh <-chan clientCATReq
+		bootstrapped      bool
+		gotPacket         bool
+		audioTxKeyed      bool
+		proxyTxKeyed      bool
+		holdUntil         time.Time
+		txSeq             uint8
+		txEM1Scratch      = make([]byte, 0, k4proto.FrameSamples20ms*4)
+		txFrameCount      uint64
+		txBurstStart      uint64
 	)
 
 	sendBootstrap := func() error {
@@ -390,6 +392,7 @@ func (s *Session) runConn(
 		}
 		bootstrapped = true
 		activeTxCh = txCh
+		activeClientCATCh = s.clientCATCh
 		s.logger.Printf("k4 session active: %s (passthrough_cat=%v)", conn.RemoteAddr(), s.cfg.PassthroughCAT)
 		return nil
 	}
@@ -447,6 +450,14 @@ func (s *Session) runConn(
 				return isEstablished(), nil, err
 			}
 
+		case <-emFixCh:
+			if bootstrapped {
+				if err := writePacket(conn, k4proto.EncodeCAT("EM1;SL0;"), writeTimeout); err != nil {
+					abortClose()
+					return isEstablished(), nil, fmt.Errorf("bridge em1 self-heal write: %w", err)
+				}
+			}
+
 		case <-pingTicker.C:
 			if !bootstrapped {
 				continue
@@ -459,12 +470,7 @@ func (s *Session) runConn(
 				return isEstablished(), nil, fmt.Errorf("bridge ping write: %w", err)
 			}
 
-		case req := <-s.clientCATCh:
-			if err := sendBootstrap(); err != nil {
-				req.done <- err
-				abortClose()
-				return isEstablished(), nil, err
-			}
+		case req := <-activeClientCATCh:
 			cmdUpper := strings.ToUpper(strings.TrimSpace(strings.TrimSuffix(req.raw, ";")))
 			outRaw := req.raw
 			if isPTTKeyCmd(cmdUpper) {
@@ -584,11 +590,12 @@ func (s *Session) runConn(
 	}
 }
 
-func (s *Session) rxLoop(conn net.Conn, firstPacketCh chan struct{}, rxErrCh chan<- error) {
+func (s *Session) rxLoop(conn net.Conn, firstPacketCh chan struct{}, emFixCh chan<- struct{}, rxErrCh chan<- error) {
 	readBuf := make([]byte, readBufferSize)
 	rxScratch := make([]int16, 0, k4proto.FrameSamples20ms*2)
 	framer := &k4proto.StreamFramer{}
 	var firstOnce sync.Once
+	var lastEM1Fix time.Time
 
 	for {
 		n, err := conn.Read(readBuf)
@@ -615,6 +622,14 @@ func (s *Session) rxLoop(conn net.Conn, firstPacketCh chan struct{}, rxErrCh cha
 					}
 					stereo, ok := k4proto.DecodeRxToStereoS16(hdr, data, s.cfg.RxGainDb, rxScratch)
 					if !ok {
+						// Self-heal if K4 stream is in Opus (EM2/EM3) instead of PCM (EM0/EM1).
+						if time.Since(lastEM1Fix) >= 2*time.Second {
+							lastEM1Fix = time.Now()
+							select {
+							case emFixCh <- struct{}{}:
+							default:
+							}
+						}
 						continue
 					}
 					rxScratch = stereo
